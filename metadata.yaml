@@ -1,7 +1,7 @@
 name: astrbot_plugin_mc_update
 display_name: Minecraft 版本更新推送
 desc: 自动检测 Java 版我的世界版本更新，通过 LLM 总结并推送到群聊，支持 QQ 官方机器人及多平台。
-version: 1.1.2
+version: 1.1.3
 author: cyone123
 repo: https://github.com/cyone123/astrbot_plugin
 astrbot_version: ">=4.5.7"

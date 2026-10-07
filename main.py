@@ -317,21 +317,45 @@ class MinecraftUpdatePlugin(Star):
         default_content = f"Minecraft Java Edition 发布了新版本 {version_id}（类型: {version_type}）。请前往官方网站查看详细更新日志。"
         return f"Minecraft Java Edition {version_id}", default_url, default_content
 
-    async def _get_chat_provider_id(self, umo: Optional[str] = None) -> Optional[str]:
-        """获取用于总结的聊天模型 Provider ID"""
+    async def _get_chat_provider(self) -> Tuple[Optional[str], Optional[Any]]:
+        """
+        获取用于总结的聊天模型 Provider ID 与 Provider 实例。
+        解析顺序：
+        1. 插件配置中显式指定的 chat_provider_id
+        2. AstrBot 系统当前/默认聊天提供商 (get_using_provider_async(None))
+        """
+        # 1. 优先使用插件配置中显式指定的 Provider ID
         configured_id = str(self.config.get("chat_provider_id", "")).strip()
         if configured_id:
-            return configured_id
+            prov = None
+            if hasattr(self.context, "get_provider_by_id"):
+                try:
+                    prov = self.context.get_provider_by_id(configured_id)
+                except Exception:
+                    pass
+            if prov:
+                return configured_id, prov
+            logger.warning(
+                f"[MC Update] 配置的 chat_provider_id '{configured_id}' 未在 AstrBot 中找到或未激活，将尝试使用系统默认模型"
+            )
+
+        # 2. 获取 AstrBot 全局当前/默认聊天提供商
         try:
-            if umo:
-                prov_id = await self.context.get_current_chat_provider_id(umo=umo)
-            else:
-                prov_id = await self.context.get_current_chat_provider_id()
-            if prov_id:
-                return prov_id
-        except Exception:
-            pass
-        return None
+            if hasattr(self.context, "get_using_provider_async"):
+                prov = await self.context.get_using_provider_async(None)
+                if prov:
+                    pid = prov.meta().id if hasattr(prov, "meta") else prov.provider_config.get("id")
+                    if pid:
+                        return pid, prov
+        except Exception as e:
+            logger.warning(f"[MC Update] 获取系统默认提供商失败: {e}")
+
+        return None, None
+
+    async def _get_chat_provider_id(self, umo: Optional[str] = None) -> Optional[str]:
+        """获取用于总结的聊天模型 Provider ID（兼容旧接口）"""
+        pid, _ = await self._get_chat_provider()
+        return pid
 
     async def _summarize_changelog(
         self,
@@ -367,12 +391,37 @@ class MinecraftUpdatePlugin(Star):
         except Exception:
             prompt = prompt_tmpl.replace("{changelog}", truncated_changelog)
 
-        provider_id = await self._get_chat_provider_id(umo)
+        provider_id, provider_inst = await self._get_chat_provider()
+
+        # 若未检测到任何可用模型，避免传入 None 导致 Provider None not found 异常
+        if not provider_id and not provider_inst:
+            logger.warning("[MC Update] 未检测到任何可用的 LLM 提供商，跳过大模型总结，使用预置摘要。请在 AstrBot 设置中添加或激活模型提供商，或在插件配置中指定 chat_provider_id。")
+            type_desc = "正式版 (Release)" if version_type == "release" else "快照/预览版 (Snapshot)"
+            return f"🎮 Minecraft Java Edition 发布了新版本：{version_id} ({type_desc})！\n由于未检测到可用的大模型提供商，未能自动生成详细摘要，请点击下方链接查看完整日志。"
+
+        # 尝试反向获取提供商实例
+        if provider_id and not provider_inst and hasattr(self.context, "get_provider_by_id"):
+            try:
+                provider_inst = self.context.get_provider_by_id(provider_id)
+            except Exception:
+                pass
+
         try:
-            llm_resp = await self.context.llm_generate(
-                chat_provider_id=provider_id,
-                prompt=prompt
-            )
+            llm_resp = None
+            # 优先方式: 调用 context.llm_generate
+            if provider_id and hasattr(self.context, "llm_generate"):
+                try:
+                    llm_resp = await self.context.llm_generate(
+                        chat_provider_id=provider_id,
+                        prompt=prompt
+                    )
+                except Exception as e:
+                    logger.warning(f"[MC Update] context.llm_generate 调用失败: {e}，尝试使用提供商实例直接调用")
+
+            # 备选方式: 直接调用 provider_inst.text_chat
+            if (not llm_resp or not getattr(llm_resp, "completion_text", None)) and provider_inst and hasattr(provider_inst, "text_chat"):
+                llm_resp = await provider_inst.text_chat(prompt=prompt)
+
             if llm_resp and hasattr(llm_resp, "completion_text") and llm_resp.completion_text:
                 return llm_resp.completion_text.strip()
         except Exception as e:
